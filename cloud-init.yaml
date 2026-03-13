@@ -1,0 +1,215 @@
+#cloud-config
+# Script d'initialisation de la VM pour lancer l'appli Flask
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - python3
+  - python3-pip
+  - python3-venv
+
+write_files:
+  # Code de l'application Flask
+  - path: /opt/flask-app/app.py
+    permissions: "0644"
+    content: |
+      # Application Flask pour gérer les fichiers sur Azure Blob Storage
+      import os
+      from flask import Flask, request, jsonify, send_file
+      from azure.storage.blob import BlobServiceClient
+      import psycopg2
+      import io
+
+      app = Flask(__name__)
+
+      STORAGE_ACCOUNT_NAME = os.environ.get("STORAGE_ACCOUNT_NAME")
+      STORAGE_ACCOUNT_KEY = os.environ.get("STORAGE_ACCOUNT_KEY")
+      CONTAINER_NAME = os.environ.get("CONTAINER_NAME")
+      DATABASE_URL = os.environ.get("DATABASE_URL")
+
+      connexion_str = (
+          f"DefaultEndpointsProtocol=https;"
+          f"AccountName={STORAGE_ACCOUNT_NAME};"
+          f"AccountKey={STORAGE_ACCOUNT_KEY};"
+          f"EndpointSuffix=core.windows.net"
+      )
+      blob_service = BlobServiceClient.from_connection_string(connexion_str)
+      conteneur = blob_service.get_container_client(CONTAINER_NAME)
+
+      def get_db():
+          return psycopg2.connect(DATABASE_URL)
+
+      def init_db():
+          conn = get_db()
+          cur = conn.cursor()
+          cur.execute("""
+              CREATE TABLE IF NOT EXISTS metadonnees (
+                  id SERIAL PRIMARY KEY,
+                  cle VARCHAR(255) UNIQUE NOT NULL,
+                  valeur TEXT NOT NULL
+              )
+          """)
+          conn.commit()
+          cur.close()
+          conn.close()
+
+      init_db()
+
+      @app.route("/")
+      def accueil():
+          return jsonify({
+              "message": "API Flask - Gestion de fichiers et metadonnees",
+              "routes": {
+                  "GET /fichiers": "Lister tous les fichiers",
+                  "POST /fichiers": "Envoyer un fichier (form-data, champ 'fichier')",
+                  "GET /fichiers/<nom>": "Telecharger un fichier",
+                  "DELETE /fichiers/<nom>": "Supprimer un fichier",
+                  "GET /db": "Lister toutes les metadonnees",
+                  "POST /db": "Creer une metadonnee (JSON: cle, valeur)",
+                  "PUT /db/<cle>": "Modifier une metadonnee",
+                  "DELETE /db/<cle>": "Supprimer une metadonnee",
+              }
+          })
+
+      @app.route("/fichiers", methods=["GET"])
+      def lister_fichiers():
+          blobs = conteneur.list_blobs()
+          fichiers = [
+              {"nom": blob.name, "taille": blob.size, "derniere_modification": str(blob.last_modified)}
+              for blob in blobs
+          ]
+          return jsonify({"fichiers": fichiers, "total": len(fichiers)})
+
+      @app.route("/fichiers", methods=["POST"])
+      def envoyer_fichier():
+          if "fichier" not in request.files:
+              return jsonify({"erreur": "Aucun fichier fourni. Utilisez le champ 'fichier'."}), 400
+          fichier = request.files["fichier"]
+          if fichier.filename == "":
+              return jsonify({"erreur": "Nom de fichier vide"}), 400
+          blob_client = conteneur.get_blob_client(fichier.filename)
+          blob_client.upload_blob(fichier.read(), overwrite=True)
+          return jsonify({"message": f"Fichier '{fichier.filename}' envoye avec succes", "nom": fichier.filename}), 201
+
+      @app.route("/fichiers/<nom>", methods=["GET"])
+      def telecharger_fichier(nom):
+          try:
+              blob_client = conteneur.get_blob_client(nom)
+              donnees = blob_client.download_blob().readall()
+              return send_file(io.BytesIO(donnees), download_name=nom, as_attachment=True)
+          except Exception:
+              return jsonify({"erreur": f"Fichier '{nom}' introuvable"}), 404
+
+      @app.route("/fichiers/<nom>", methods=["DELETE"])
+      def supprimer_fichier(nom):
+          try:
+              blob_client = conteneur.get_blob_client(nom)
+              blob_client.delete_blob()
+              return jsonify({"message": f"Fichier '{nom}' supprime avec succes"})
+          except Exception:
+              return jsonify({"erreur": f"Fichier '{nom}' introuvable"}), 404
+
+      @app.route("/db", methods=["GET"])
+      def lister_metadonnees():
+          conn = get_db()
+          cur = conn.cursor()
+          cur.execute("SELECT id, cle, valeur FROM metadonnees ORDER BY id")
+          rows = [{"id": r[0], "cle": r[1], "valeur": r[2]} for r in cur.fetchall()]
+          cur.close()
+          conn.close()
+          return jsonify({"metadonnees": rows, "total": len(rows)})
+
+      @app.route("/db", methods=["POST"])
+      def creer_metadonnee():
+          data = request.get_json()
+          if not data or "cle" not in data or "valeur" not in data:
+              return jsonify({"erreur": "JSON requis avec 'cle' et 'valeur'"}), 400
+          conn = get_db()
+          cur = conn.cursor()
+          try:
+              cur.execute("INSERT INTO metadonnees (cle, valeur) VALUES (%s, %s) RETURNING id", (data["cle"], data["valeur"]))
+              new_id = cur.fetchone()[0]
+              conn.commit()
+          except psycopg2.errors.UniqueViolation:
+              conn.rollback()
+              cur.close()
+              conn.close()
+              return jsonify({"erreur": f"La cle '{data['cle']}' existe deja"}), 409
+          cur.close()
+          conn.close()
+          return jsonify({"message": "Metadonnee creee", "id": new_id, "cle": data["cle"], "valeur": data["valeur"]}), 201
+
+      @app.route("/db/<cle>", methods=["PUT"])
+      def modifier_metadonnee(cle):
+          data = request.get_json()
+          if not data or "valeur" not in data:
+              return jsonify({"erreur": "JSON requis avec 'valeur'"}), 400
+          conn = get_db()
+          cur = conn.cursor()
+          cur.execute("UPDATE metadonnees SET valeur = %s WHERE cle = %s", (data["valeur"], cle))
+          if cur.rowcount == 0:
+              cur.close()
+              conn.close()
+              return jsonify({"erreur": f"Cle '{cle}' introuvable"}), 404
+          conn.commit()
+          cur.close()
+          conn.close()
+          return jsonify({"message": f"Metadonnee '{cle}' modifiee", "cle": cle, "valeur": data["valeur"]})
+
+      @app.route("/db/<cle>", methods=["DELETE"])
+      def supprimer_metadonnee(cle):
+          conn = get_db()
+          cur = conn.cursor()
+          cur.execute("DELETE FROM metadonnees WHERE cle = %s", (cle,))
+          if cur.rowcount == 0:
+              cur.close()
+              conn.close()
+              return jsonify({"erreur": f"Cle '{cle}' introuvable"}), 404
+          conn.commit()
+          cur.close()
+          conn.close()
+          return jsonify({"message": f"Metadonnee '{cle}' supprimee"})
+
+      if __name__ == "__main__":
+          app.run(host="0.0.0.0", port=5000)
+
+  # Fichier de dépendances Python
+  - path: /opt/flask-app/requirements.txt
+    permissions: "0644"
+    content: |
+      flask
+      azure-storage-blob
+      psycopg2-binary
+
+  # Service systemd pour lancer Flask automatiquement
+  - path: /etc/systemd/system/flask-app.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Application Flask - Gestion de fichiers Blob Storage
+      After=network.target
+
+      [Service]
+      Type=simple
+      User=root
+      WorkingDirectory=/opt/flask-app
+      Environment=STORAGE_ACCOUNT_NAME=${storage_account_name}
+      Environment=STORAGE_ACCOUNT_KEY=${storage_account_key}
+      Environment=CONTAINER_NAME=${container_name}
+      Environment=DATABASE_URL=postgresql://${db_user}:${db_password}@${db_host}:5432/${db_name}?sslmode=require
+      ExecStart=/opt/flask-app/venv/bin/python app.py
+      Restart=always
+      RestartSec=3
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Créer un venv python et installer les déps
+  - python3 -m venv /opt/flask-app/venv
+  - /opt/flask-app/venv/bin/pip install -r /opt/flask-app/requirements.txt
+  # Activer et démarrer Flask
+  - systemctl daemon-reload
+  - systemctl enable flask-app.service
+  - systemctl start flask-app.service

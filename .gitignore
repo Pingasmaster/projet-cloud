@@ -1,0 +1,6 @@
+# Fichiers sensibles - NE PAS commiter
+terraform.tfvars
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
